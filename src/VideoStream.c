@@ -36,8 +36,11 @@ static bool receivedFullFrame;
 
 // Adaptive bitrate (Apollo fork extension, host advertises SS_FF_AP_ADAPTIVE_BITRATE).
 //
-// Delay-based congestion detection: for every frame we take the arrival time of its
-// last packet minus its capture time (RTP timestamp). The unknown clock offset is
+// Delay-based congestion detection: for every newly captured frame we take the time it
+// was completely received minus its capture time (RTP timestamp) minus the host's
+// processing time (capture to send, reported in the frame header). Repeated frames
+// (sent at the minimum frame rate while nothing changes) are skipped: their timestamp
+// is not a capture time and would look up to ~100 ms late. The unknown clock offset is
 // removed by subtracting the minimum over the last ~30 s, which leaves the queuing
 // delay along the path. Single delay spikes (common on mobile links) are ignored by
 // only looking at the smallest delay within each 250 ms window: if even that one is
@@ -62,14 +65,13 @@ static struct {
     bool enabled;
     bool haveFrame;
     uint32_t firstTs;
-    uint32_t curTs;
-    uint64_t curLastArrivalUs;
 
     int64_t bucketMin[ABR_BUCKETS];
     int bucketIndex;
     uint64_t bucketStartUs;
 
     uint64_t windowStartUs;
+    uint64_t lastFrameUs;
     int64_t windowMinDelayUs;
     double queueDelayMs;
 
@@ -151,10 +153,23 @@ static void abrEvaluate(uint64_t nowUs) {
     }
 }
 
-static void abrOnFrame(uint32_t rtpTimestamp, uint64_t arrivalUs) {
+// Called by the depacketizer (receive thread) for every completely received frame.
+// hostProcessingLatency is in 1/10 ms; 0 means a repeated frame or no data from the host.
+void abrOnFrameComplete(uint32_t rtpTimestamp, uint64_t arrivalUs, uint16_t hostProcessingLatency) {
+    if (!abr.enabled || hostProcessingLatency == 0) {
+        return;
+    }
+
+    if (!abr.haveFrame) {
+        abr.haveFrame = true;
+        abr.firstTs = rtpTimestamp;
+    }
+
+    abr.lastFrameUs = arrivalUs;
+
     // RTP video timestamps use a 90 kHz clock based on the host's capture time
     uint64_t captureUs = (uint64_t)(uint32_t)(rtpTimestamp - abr.firstTs) * 1000 / 90;
-    int64_t delayUs = (int64_t)arrivalUs - (int64_t)captureUs;
+    int64_t delayUs = (int64_t)arrivalUs - (int64_t)captureUs - (int64_t)hostProcessingLatency * 100;
 
     if (abr.bucketStartUs == 0) {
         abr.bucketStartUs = arrivalUs;
@@ -191,7 +206,7 @@ static void abrOnFrame(uint32_t rtpTimestamp, uint64_t arrivalUs) {
     }
 }
 
-static void abrOnPacket(uint32_t rtpTimestamp, int length) {
+static void abrOnPacket(int length) {
     if (!abr.enabled) {
         return;
     }
@@ -208,24 +223,12 @@ static void abrOnPacket(uint32_t rtpTimestamp, int length) {
         abr.rateWindowStartUs = now;
     }
 
-    if (!abr.haveFrame) {
-        abr.haveFrame = true;
-        abr.firstTs = rtpTimestamp;
-        abr.curTs = rtpTimestamp;
-        abr.curLastArrivalUs = now;
-        return;
+    // Nothing new on screen for a while (only repeated frames): there is no delay sample,
+    // but also no sign of congestion, so keep recovering the bitrate.
+    if (abr.haveFrame && now - abr.lastFrameUs >= 1000000 && now - abr.lastUpdateUs >= ABR_WINDOW_US) {
+        abr.queueDelayMs = 0;
+        abrEvaluate(now);
     }
-
-    if (rtpTimestamp == abr.curTs) {
-        abr.curLastArrivalUs = now;
-    }
-    else if ((int32_t)(rtpTimestamp - abr.curTs) > 0) {
-        // First packet of a newer frame: the previous frame is complete
-        abrOnFrame(abr.curTs, abr.curLastArrivalUs);
-        abr.curTs = rtpTimestamp;
-        abr.curLastArrivalUs = now;
-    }
-    // Packets of older frames (reordering) are ignored
 }
 
 // Initialize the video stream
@@ -421,7 +424,7 @@ static void VideoReceiveThreadProc(void* context) {
         packet->timestamp = BE32(packet->timestamp);
         packet->ssrc = BE32(packet->ssrc);
 
-        abrOnPacket(packet->timestamp, err);
+        abrOnPacket(err);
 
         queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
 

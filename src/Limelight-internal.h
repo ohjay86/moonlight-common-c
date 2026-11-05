@@ -143,6 +143,7 @@ void initializeVideoStream(void);
 void destroyVideoStream(void);
 void notifyKeyFrameReceived(void);
 uint32_t abrGetRequestedBitrate(void);
+void abrOnFrameComplete(uint32_t rtpTimestamp, uint64_t arrivalUs, uint16_t hostProcessingLatency);
 int startVideoStream(void* rendererContext, int drFlags);
 void stopVideoStream(void);
 

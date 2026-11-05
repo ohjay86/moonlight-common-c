@@ -491,6 +491,8 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
             qdu->decodeUnit.rtpTimestamp = firstPacketRtpTimestamp;
             qdu->decodeUnit.enqueueTimeUs = PltGetMicroseconds();
 
+            abrOnFrameComplete(firstPacketRtpTimestamp, qdu->decodeUnit.enqueueTimeUs, frameHostProcessingLatency);
+
             // These might be wrong for a few frames during a transition between SDR and HDR,
             // but the effects shouldn't very noticable since that's an infrequent operation.
             //
