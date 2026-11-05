@@ -39,17 +39,20 @@ static bool receivedFullFrame;
 // Delay-based congestion detection: for every frame we take the arrival time of its
 // last packet minus its capture time (RTP timestamp). The unknown clock offset is
 // removed by subtracting the minimum over the last ~30 s, which leaves the queuing
-// delay along the path. If it grows, the bitrate is cut to a fraction of the measured
-// receive rate (multiplicative decrease); while the path is calm it is raised slowly
-// (additive increase) up to the configured bitrate. The requested bitrate is sent to
-// the host by the control stream thread (see abrGetRequestedBitrate()).
+// delay along the path. Single delay spikes (common on mobile links) are ignored by
+// only looking at the smallest delay within each 250 ms window: if even that one is
+// high, a queue is standing in the path. Then the bitrate is cut (multiplicative
+// decrease); while the path is calm it is raised slowly (additive increase) up to the
+// configured bitrate. The requested bitrate is sent to the host by the control stream
+// thread (see abrGetRequestedBitrate()).
 #define ABR_BUCKET_US           5000000   // min-delay bucket length
 #define ABR_BUCKETS             6         // -> baseline over the last 30 s
+#define ABR_WINDOW_US           250000    // evaluation window (standing queue = min delay in window)
 #define ABR_RATE_WINDOW_US      500000    // receive rate measurement window
-#define ABR_OVERUSE_MS          25.0      // smoothed queuing delay that counts as congestion
-#define ABR_NORMAL_MS           12.0      // below this the path is considered calm
-#define ABR_DECREASE_FACTOR     0.85      // new bitrate = factor * measured receive rate
-#define ABR_DECREASE_HOLD_US    500000    // minimum time between two decreases
+#define ABR_OVERUSE_MS          30.0      // standing queue that counts as congestion
+#define ABR_NORMAL_MS           15.0      // below this the path is considered calm
+#define ABR_DECREASE_FACTOR     0.85
+#define ABR_DECREASE_HOLD_US    1000000   // minimum time between two decreases (let the queue drain)
 #define ABR_INCREASE_DELAY_US   2000000   // no increase for this long after a decrease
 #define ABR_INCREASE_PER_SEC    0.05      // + 5 % of the configured bitrate per second while calm
 #define ABR_MIN_KBPS            1000
@@ -66,6 +69,8 @@ static struct {
     int bucketIndex;
     uint64_t bucketStartUs;
 
+    uint64_t windowStartUs;
+    int64_t windowMinDelayUs;
     double queueDelayMs;
 
     uint64_t rateBytes;
@@ -83,6 +88,7 @@ static void abrInitialize(void) {
     memset(&abr, 0, sizeof(abr));
     abr.enabled = IS_SUNSHINE() && (SunshineFeatureFlags & SS_FF_AP_ADAPTIVE_BITRATE) && StreamConfig.bitrate > 0;
     abr.targetKbps = StreamConfig.bitrate;
+    abr.windowMinDelayUs = INT64_MAX;
     for (int i = 0; i < ABR_BUCKETS; i++) {
         abr.bucketMin[i] = INT64_MAX;
     }
@@ -93,6 +99,56 @@ static void abrInitialize(void) {
 
 uint32_t abrGetRequestedBitrate(void) {
     return abr.requestedKbps;
+}
+
+// Called once per evaluation window with the standing queuing delay
+static void abrEvaluate(uint64_t nowUs) {
+    double maxKbps = StreamConfig.bitrate;
+    double newTarget = abr.targetKbps;
+
+    if (abr.queueDelayMs > ABR_OVERUSE_MS) {
+        if (nowUs - abr.lastDecreaseUs >= ABR_DECREASE_HOLD_US) {
+            // If the stream actually uses its bitrate, the receive rate tells what got through.
+            // With little motion the encoder stays far below the target, then just step down.
+            if (abr.recvKbps >= 0.5 * abr.targetKbps) {
+                newTarget = ABR_DECREASE_FACTOR * abr.recvKbps;
+            }
+            if (newTarget > ABR_DECREASE_FACTOR * abr.targetKbps) {
+                newTarget = ABR_DECREASE_FACTOR * abr.targetKbps;
+            }
+            abr.lastDecreaseUs = nowUs;
+            Limelog("ABR: congestion (queue %.1f ms, recv %.0f kbps) -> %.0f kbps\n",
+                    abr.queueDelayMs, abr.recvKbps, newTarget < ABR_MIN_KBPS ? ABR_MIN_KBPS : newTarget);
+        }
+    }
+    else if (abr.queueDelayMs < ABR_NORMAL_MS && nowUs - abr.lastDecreaseUs >= ABR_INCREASE_DELAY_US) {
+        if (abr.lastUpdateUs != 0) {
+            double dt = (nowUs - abr.lastUpdateUs) / 1000000.0;
+            newTarget += maxKbps * ABR_INCREASE_PER_SEC * dt;
+        }
+    }
+    abr.lastUpdateUs = nowUs;
+
+    if (newTarget > maxKbps) {
+        newTarget = maxKbps;
+    }
+    if (newTarget < ABR_MIN_KBPS) {
+        newTarget = ABR_MIN_KBPS;
+    }
+    abr.targetKbps = newTarget;
+
+    // Only signal changes of at least 3 %, plus the final step back to the maximum
+    uint32_t current = abr.requestedKbps ? abr.requestedKbps : (uint32_t)maxKbps;
+    if (newTarget < current * 0.97 || newTarget > current * 1.03 ||
+        (newTarget == maxKbps && current != (uint32_t)maxKbps)) {
+        abr.requestedKbps = (uint32_t)newTarget;
+    }
+
+    if (nowUs - abr.lastLogUs >= ABR_LOG_INTERVAL_US) {
+        abr.lastLogUs = nowUs;
+        Limelog("ABR: queue %.1f ms, recv %.0f kbps, target %.0f kbps\n",
+                abr.queueDelayMs, abr.recvKbps, abr.targetKbps);
+    }
 }
 
 static void abrOnFrame(uint32_t rtpTimestamp, uint64_t arrivalUs) {
@@ -112,59 +168,26 @@ static void abrOnFrame(uint32_t rtpTimestamp, uint64_t arrivalUs) {
         abr.bucketMin[abr.bucketIndex] = delayUs;
     }
 
-    int64_t baseline = INT64_MAX;
-    for (int i = 0; i < ABR_BUCKETS; i++) {
-        if (abr.bucketMin[i] < baseline) {
-            baseline = abr.bucketMin[i];
-        }
+    if (abr.windowStartUs == 0) {
+        abr.windowStartUs = arrivalUs;
+    }
+    if (delayUs < abr.windowMinDelayUs) {
+        abr.windowMinDelayUs = delayUs;
     }
 
-    double queueMs = (delayUs - baseline) / 1000.0;
-    abr.queueDelayMs = 0.8 * abr.queueDelayMs + 0.2 * queueMs;
-
-    double maxKbps = StreamConfig.bitrate;
-    double newTarget = abr.targetKbps;
-
-    if (abr.queueDelayMs > ABR_OVERUSE_MS) {
-        if (arrivalUs - abr.lastDecreaseUs >= ABR_DECREASE_HOLD_US) {
-            double basis = abr.recvKbps > 0 ? abr.recvKbps : abr.targetKbps;
-            newTarget = ABR_DECREASE_FACTOR * basis;
-            if (newTarget > abr.targetKbps * ABR_DECREASE_FACTOR) {
-                // Always back off noticeably, even if the receive rate is still high
-                newTarget = abr.targetKbps * ABR_DECREASE_FACTOR;
+    if (arrivalUs - abr.windowStartUs >= ABR_WINDOW_US) {
+        int64_t baseline = INT64_MAX;
+        for (int i = 0; i < ABR_BUCKETS; i++) {
+            if (abr.bucketMin[i] < baseline) {
+                baseline = abr.bucketMin[i];
             }
-            abr.lastDecreaseUs = arrivalUs;
-            Limelog("ABR: congestion (queue %.1f ms, recv %.0f kbps) -> %.0f kbps\n",
-                    abr.queueDelayMs, abr.recvKbps, newTarget < ABR_MIN_KBPS ? ABR_MIN_KBPS : newTarget);
         }
-    }
-    else if (abr.queueDelayMs < ABR_NORMAL_MS && arrivalUs - abr.lastDecreaseUs >= ABR_INCREASE_DELAY_US) {
-        if (abr.lastUpdateUs != 0) {
-            double dt = (arrivalUs - abr.lastUpdateUs) / 1000000.0;
-            newTarget += maxKbps * ABR_INCREASE_PER_SEC * dt;
-        }
-    }
-    abr.lastUpdateUs = arrivalUs;
 
-    if (newTarget > maxKbps) {
-        newTarget = maxKbps;
-    }
-    if (newTarget < ABR_MIN_KBPS) {
-        newTarget = ABR_MIN_KBPS;
-    }
-    abr.targetKbps = newTarget;
+        abr.queueDelayMs = (abr.windowMinDelayUs - baseline) / 1000.0;
+        abr.windowMinDelayUs = INT64_MAX;
+        abr.windowStartUs = arrivalUs;
 
-    // Only signal changes of at least 3 %, plus the final step back to the maximum
-    uint32_t current = abr.requestedKbps ? abr.requestedKbps : (uint32_t)maxKbps;
-    if (newTarget < current * 0.97 || newTarget > current * 1.03 ||
-        (newTarget == maxKbps && current != (uint32_t)maxKbps)) {
-        abr.requestedKbps = (uint32_t)newTarget;
-    }
-
-    if (arrivalUs - abr.lastLogUs >= ABR_LOG_INTERVAL_US) {
-        abr.lastLogUs = arrivalUs;
-        Limelog("ABR: queue %.1f ms, recv %.0f kbps, target %.0f kbps\n",
-                abr.queueDelayMs, abr.recvKbps, abr.targetKbps);
+        abrEvaluate(arrivalUs);
     }
 }
 
