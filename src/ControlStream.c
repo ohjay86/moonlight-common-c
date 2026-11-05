@@ -1387,6 +1387,7 @@ static void controlReceiveThreadFunc(void* context) {
 
 static void lossStatsThreadFunc(void* context) {
     BYTE_BUFFER byteBuffer;
+    uint32_t lastSentBitrateKbps = 0;
 
     if (usePeriodicPing) {
         char periodicPingPayload[8];
@@ -1418,6 +1419,25 @@ static void lossStatsThreadFunc(void* context) {
                     }
 
                     free(queuedFrameStatus);
+                }
+            }
+
+            // Adaptive bitrate: forward a changed bitrate request to the host
+            if (IS_SUNSHINE() && (SunshineFeatureFlags & SS_FF_AP_ADAPTIVE_BITRATE)) {
+                uint32_t requestedKbps = abrGetRequestedBitrate();
+                if (requestedKbps != 0 && requestedKbps != lastSentBitrateKbps) {
+                    uint32_t payload = LE32(requestedKbps);
+                    if (!sendMessageEnet(AP_SET_BITRATE_PTYPE,
+                                         sizeof(payload),
+                                         &payload,
+                                         CTRL_CHANNEL_GENERIC,
+                                         ENET_PACKET_FLAG_RELIABLE,
+                                         false)) {
+                        Limelog("Loss Stats: Sending bitrate request failed: %d\n", (int)LastSocketError());
+                        ListenerCallbacks.connectionTerminated(LastSocketFail());
+                        return;
+                    }
+                    lastSentBitrateKbps = requestedKbps;
                 }
             }
 

@@ -34,6 +34,177 @@ static bool receivedFullFrame;
 // and subsequent packet/frame bursts that follow.
 #define RTP_RECV_PACKETS_BUFFERED 2048
 
+// Adaptive bitrate (Apollo fork extension, host advertises SS_FF_AP_ADAPTIVE_BITRATE).
+//
+// Delay-based congestion detection: for every frame we take the arrival time of its
+// last packet minus its capture time (RTP timestamp). The unknown clock offset is
+// removed by subtracting the minimum over the last ~30 s, which leaves the queuing
+// delay along the path. If it grows, the bitrate is cut to a fraction of the measured
+// receive rate (multiplicative decrease); while the path is calm it is raised slowly
+// (additive increase) up to the configured bitrate. The requested bitrate is sent to
+// the host by the control stream thread (see abrGetRequestedBitrate()).
+#define ABR_BUCKET_US           5000000   // min-delay bucket length
+#define ABR_BUCKETS             6         // -> baseline over the last 30 s
+#define ABR_RATE_WINDOW_US      500000    // receive rate measurement window
+#define ABR_OVERUSE_MS          25.0      // smoothed queuing delay that counts as congestion
+#define ABR_NORMAL_MS           12.0      // below this the path is considered calm
+#define ABR_DECREASE_FACTOR     0.85      // new bitrate = factor * measured receive rate
+#define ABR_DECREASE_HOLD_US    500000    // minimum time between two decreases
+#define ABR_INCREASE_DELAY_US   2000000   // no increase for this long after a decrease
+#define ABR_INCREASE_PER_SEC    0.05      // + 5 % of the configured bitrate per second while calm
+#define ABR_MIN_KBPS            1000
+#define ABR_LOG_INTERVAL_US     5000000
+
+static struct {
+    bool enabled;
+    bool haveFrame;
+    uint32_t firstTs;
+    uint32_t curTs;
+    uint64_t curLastArrivalUs;
+
+    int64_t bucketMin[ABR_BUCKETS];
+    int bucketIndex;
+    uint64_t bucketStartUs;
+
+    double queueDelayMs;
+
+    uint64_t rateBytes;
+    uint64_t rateWindowStartUs;
+    double recvKbps;
+
+    double targetKbps;
+    uint64_t lastDecreaseUs;
+    uint64_t lastUpdateUs;
+    uint64_t lastLogUs;
+    volatile uint32_t requestedKbps;
+} abr;
+
+static void abrInitialize(void) {
+    memset(&abr, 0, sizeof(abr));
+    abr.enabled = IS_SUNSHINE() && (SunshineFeatureFlags & SS_FF_AP_ADAPTIVE_BITRATE) && StreamConfig.bitrate > 0;
+    abr.targetKbps = StreamConfig.bitrate;
+    for (int i = 0; i < ABR_BUCKETS; i++) {
+        abr.bucketMin[i] = INT64_MAX;
+    }
+    if (abr.enabled) {
+        Limelog("ABR: adaptive bitrate enabled (max %d kbps)\n", StreamConfig.bitrate);
+    }
+}
+
+uint32_t abrGetRequestedBitrate(void) {
+    return abr.requestedKbps;
+}
+
+static void abrOnFrame(uint32_t rtpTimestamp, uint64_t arrivalUs) {
+    // RTP video timestamps use a 90 kHz clock based on the host's capture time
+    uint64_t captureUs = (uint64_t)(uint32_t)(rtpTimestamp - abr.firstTs) * 1000 / 90;
+    int64_t delayUs = (int64_t)arrivalUs - (int64_t)captureUs;
+
+    if (abr.bucketStartUs == 0) {
+        abr.bucketStartUs = arrivalUs;
+    }
+    else if (arrivalUs - abr.bucketStartUs >= ABR_BUCKET_US) {
+        abr.bucketIndex = (abr.bucketIndex + 1) % ABR_BUCKETS;
+        abr.bucketMin[abr.bucketIndex] = INT64_MAX;
+        abr.bucketStartUs = arrivalUs;
+    }
+    if (delayUs < abr.bucketMin[abr.bucketIndex]) {
+        abr.bucketMin[abr.bucketIndex] = delayUs;
+    }
+
+    int64_t baseline = INT64_MAX;
+    for (int i = 0; i < ABR_BUCKETS; i++) {
+        if (abr.bucketMin[i] < baseline) {
+            baseline = abr.bucketMin[i];
+        }
+    }
+
+    double queueMs = (delayUs - baseline) / 1000.0;
+    abr.queueDelayMs = 0.8 * abr.queueDelayMs + 0.2 * queueMs;
+
+    double maxKbps = StreamConfig.bitrate;
+    double newTarget = abr.targetKbps;
+
+    if (abr.queueDelayMs > ABR_OVERUSE_MS) {
+        if (arrivalUs - abr.lastDecreaseUs >= ABR_DECREASE_HOLD_US) {
+            double basis = abr.recvKbps > 0 ? abr.recvKbps : abr.targetKbps;
+            newTarget = ABR_DECREASE_FACTOR * basis;
+            if (newTarget > abr.targetKbps * ABR_DECREASE_FACTOR) {
+                // Always back off noticeably, even if the receive rate is still high
+                newTarget = abr.targetKbps * ABR_DECREASE_FACTOR;
+            }
+            abr.lastDecreaseUs = arrivalUs;
+            Limelog("ABR: congestion (queue %.1f ms, recv %.0f kbps) -> %.0f kbps\n",
+                    abr.queueDelayMs, abr.recvKbps, newTarget < ABR_MIN_KBPS ? ABR_MIN_KBPS : newTarget);
+        }
+    }
+    else if (abr.queueDelayMs < ABR_NORMAL_MS && arrivalUs - abr.lastDecreaseUs >= ABR_INCREASE_DELAY_US) {
+        if (abr.lastUpdateUs != 0) {
+            double dt = (arrivalUs - abr.lastUpdateUs) / 1000000.0;
+            newTarget += maxKbps * ABR_INCREASE_PER_SEC * dt;
+        }
+    }
+    abr.lastUpdateUs = arrivalUs;
+
+    if (newTarget > maxKbps) {
+        newTarget = maxKbps;
+    }
+    if (newTarget < ABR_MIN_KBPS) {
+        newTarget = ABR_MIN_KBPS;
+    }
+    abr.targetKbps = newTarget;
+
+    // Only signal changes of at least 3 %, plus the final step back to the maximum
+    uint32_t current = abr.requestedKbps ? abr.requestedKbps : (uint32_t)maxKbps;
+    if (newTarget < current * 0.97 || newTarget > current * 1.03 ||
+        (newTarget == maxKbps && current != (uint32_t)maxKbps)) {
+        abr.requestedKbps = (uint32_t)newTarget;
+    }
+
+    if (arrivalUs - abr.lastLogUs >= ABR_LOG_INTERVAL_US) {
+        abr.lastLogUs = arrivalUs;
+        Limelog("ABR: queue %.1f ms, recv %.0f kbps, target %.0f kbps\n",
+                abr.queueDelayMs, abr.recvKbps, abr.targetKbps);
+    }
+}
+
+static void abrOnPacket(uint32_t rtpTimestamp, int length) {
+    if (!abr.enabled) {
+        return;
+    }
+
+    uint64_t now = PltGetMicroseconds();
+
+    abr.rateBytes += length;
+    if (abr.rateWindowStartUs == 0) {
+        abr.rateWindowStartUs = now;
+    }
+    else if (now - abr.rateWindowStartUs >= ABR_RATE_WINDOW_US) {
+        abr.recvKbps = abr.rateBytes * 8.0 / ((now - abr.rateWindowStartUs) / 1000.0);
+        abr.rateBytes = 0;
+        abr.rateWindowStartUs = now;
+    }
+
+    if (!abr.haveFrame) {
+        abr.haveFrame = true;
+        abr.firstTs = rtpTimestamp;
+        abr.curTs = rtpTimestamp;
+        abr.curLastArrivalUs = now;
+        return;
+    }
+
+    if (rtpTimestamp == abr.curTs) {
+        abr.curLastArrivalUs = now;
+    }
+    else if ((int32_t)(rtpTimestamp - abr.curTs) > 0) {
+        // First packet of a newer frame: the previous frame is complete
+        abrOnFrame(abr.curTs, abr.curLastArrivalUs);
+        abr.curTs = rtpTimestamp;
+        abr.curLastArrivalUs = now;
+    }
+    // Packets of older frames (reordering) are ignored
+}
+
 // Initialize the video stream
 void initializeVideoStream(void) {
     initializeVideoDepacketizer(StreamConfig.packetSize);
@@ -227,6 +398,8 @@ static void VideoReceiveThreadProc(void* context) {
         packet->timestamp = BE32(packet->timestamp);
         packet->ssrc = BE32(packet->ssrc);
 
+        abrOnPacket(packet->timestamp, err);
+
         queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
 
         if (queueStatus == RTPF_RET_QUEUED) {
@@ -318,6 +491,9 @@ int startVideoStream(void* rendererContext, int drFlags) {
     int err;
 
     firstFrameSocket = INVALID_SOCKET;
+
+    // RTSP negotiation is done at this point, so the host's feature flags are known
+    abrInitialize();
 
     // This must be called before the decoder thread starts submitting
     // decode units

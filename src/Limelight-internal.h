@@ -88,6 +88,10 @@ extern uint32_t EncryptionFeaturesEnabled;
 #define ML_FF_FEC_STATUS 0x01 // Client sends SS_FRAME_FEC_STATUS for frame losses
 #define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
 
+// Apollo fork extension in x-ss-general.featureFlags: host accepts AP_SET_BITRATE_PTYPE
+#define SS_FF_AP_ADAPTIVE_BITRATE 0x40000000
+#define AP_SET_BITRATE_PTYPE 0x3010 // payload: uint32 LE bitrate in kbps (same units as StreamConfig.bitrate)
+
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 
 // At this value or above, we will request high quality audio unless CAPABILITY_SLOW_OPUS_DECODER
@@ -138,6 +142,7 @@ void notifyFrameLost(unsigned int frameNumber, bool speculative);
 void initializeVideoStream(void);
 void destroyVideoStream(void);
 void notifyKeyFrameReceived(void);
+uint32_t abrGetRequestedBitrate(void);
 int startVideoStream(void* rendererContext, int drFlags);
 void stopVideoStream(void);
 
